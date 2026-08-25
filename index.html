@@ -7,8 +7,6 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
-<link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet">
-<script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
 <style>
 :root{
   --bg:#EFE7D9;
@@ -335,7 +333,7 @@ footer{padding:16px 28px;border-top:1px solid var(--line);color:var(--text-faint
       <label>배경지도</label>
       <div class="seg" id="basemapSeg">
         <button data-v="off" class="active">끄기</button>
-        <button data-v="on">OSM</button>
+        <button data-v="on">위성</button>
       </div>
     </div>
   </div>
@@ -378,7 +376,7 @@ footer{padding:16px 28px;border-top:1px solid var(--line);color:var(--text-faint
       <div class="legend-scale"><span>0%</span><span>50%</span><span>100%</span></div>
     </div>
     <div class="tooltip" id="tooltip"></div>
-    <div class="map-attrib" id="mapAttrib" style="display:none;">© OpenStreetMap contributors · via OpenFreeMap</div>
+    <div class="map-attrib" id="mapAttrib" style="display:none;">Imagery © Esri, Maxar, Earthstar Geographics</div>
   </div>
 
   <aside class="drawer" id="drawer">
@@ -703,7 +701,7 @@ function initScene(){
   animate();
 }
 
-let groundGrid, groundDisk, basemapGroup;
+let groundGrid, groundDisk, basemapGroup, highlightGroup;
 function buildGround(){
   const size = 420;
   groundGrid = new THREE.GridHelper(size, 56, 0xb7a086, 0xd9c8ac);
@@ -720,110 +718,114 @@ function buildGround(){
   basemapGroup = new THREE.Group();
   basemapGroup.visible = false;
   scene.add(basemapGroup);
+
+  highlightGroup = new THREE.Group();
+  scene.add(highlightGroup);
 }
 
-/* ---- OpenStreetMap basemap via MapLibre GL JS + OpenFreeMap ----
-   Raw raster tile servers either omit CORS headers (tile.openstreetmap.org) or now
-   require an API key (CARTO's basemaps.cartocdn.com, which is why the previous
-   version showed a broken "API key required" watermark). OpenFreeMap is a free,
-   key-less vector tile service built for direct client-side embedding: we render
-   it off-screen once with MapLibre and use the resulting canvas as a single Three.js
-   texture, which sidesteps CORS entirely since it's a same-page canvas. */
+/* ---- Satellite imagery basemap (Esri World Imagery) ----
+   Google's satellite tiles can't be used here: there's no free key-less way to pull raw
+   Google Maps imagery (their tile endpoints are locked down and reusing map pixels as a
+   texture on other geometry falls outside what their JS API's terms allow even with a
+   paid key). Esri World Imagery is genuine aerial/satellite photography, served as plain
+   XYZ-style raster tiles with no key and CORS enabled, which is why it's the standard
+   free substitute across GIS tools (QGIS's default satellite layer, Leaflet/OpenLayers
+   tutorials, etc.) -- suitable for light, non-commercial use like this. Being a photo
+   with no baked-in vector labels also sidesteps the mirrored-text issue from the OSM
+   version, and each tile is placed at its exact 4 corners (not an axis-aligned bounding
+   box) so it lines up correctly with the buildings' grid-north frame. */
 let basemapBuilt = false;
-let maplibreMap = null;
+
+function esriTileUrl(z,x,y){
+  return `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${z}/${y}/${x}`;
+}
 
 function buildBasemap(){
   if(basemapBuilt) return;
   basemapBuilt = true;
 
-  if(typeof maplibregl === 'undefined'){
-    console.warn('MapLibre GL JS not loaded; OSM basemap unavailable.');
-    document.getElementById('mapAttrib').textContent = '지도 라이브러리를 불러오지 못했습니다 (네트워크 확인)';
-    return;
-  }
-
+  const zoom = 18;
   const margin = 90;
-  const halfExtent = 150 + margin; // covers the campus footprint (~300m) plus padding
-  const pxSize = 900;
-  const container = document.createElement('div');
-  container.style.cssText = `position:fixed;left:-99999px;top:0;width:${pxSize}px;height:${pxSize}px;`;
-  document.body.appendChild(container);
-
-  const latRad = GEO.origin_lat * Math.PI/180;
-  const desiredMPerPx = (2*halfExtent) / pxSize;
-  const zoom = Math.log2(156543.03392 * Math.cos(latRad) / desiredMPerPx);
-
-  maplibreMap = new maplibregl.Map({
-    container,
-    style: 'https://tiles.openfreemap.org/styles/liberty',
-    center: [GEO.origin_lon, GEO.origin_lat],
-    zoom: zoom,
-    bearing: 0,
-    pitch: 0,
-    interactive: false,
-    attributionControl: false,
-    canvasContextAttributes: {preserveDrawingBuffer:true},
+  const corners = [[-margin,-margin],[margin,-margin],[-margin,margin],[margin,margin]];
+  let minLon=Infinity,maxLon=-Infinity,minLat=Infinity,maxLat=-Infinity;
+  corners.forEach(([x,z])=>{
+    const {lon,lat} = localToLonLat(x,z);
+    minLon=Math.min(minLon,lon); maxLon=Math.max(maxLon,lon);
+    minLat=Math.min(minLat,lat); maxLat=Math.max(maxLat,lat);
   });
+  const xMin = Math.floor(lon2tileX(minLon, zoom));
+  const xMax = Math.floor(lon2tileX(maxLon, zoom));
+  const yMin = Math.floor(lat2tileY(maxLat, zoom));
+  const yMax = Math.floor(lat2tileY(minLat, zoom));
 
-  maplibreMap.once('idle', ()=>{
-    mountBasemapPlane();
-    document.getElementById('mapAttrib').textContent = '© OpenStreetMap contributors · via OpenFreeMap';
-  });
-  maplibreMap.on('error', (e)=>{
-    console.warn('OSM basemap load error', e && e.error);
-    document.getElementById('mapAttrib').textContent = '지도를 불러오지 못했습니다 (네트워크 확인) · © OpenStreetMap contributors';
-  });
+  const loader = new THREE.TextureLoader();
+  loader.setCrossOrigin('anonymous');
+  let pending = 0, failed = 0, total = 0;
+
+  for(let tx=xMin; tx<=xMax; tx++){
+    for(let ty=yMin; ty<=yMax; ty++){
+      total++; pending++;
+      const lon0 = tileX2lon(tx, zoom), lon1 = tileX2lon(tx+1, zoom);
+      const lat0 = tileY2lat(ty, zoom), lat1 = tileY2lat(ty+1, zoom); // lat0 (north) > lat1 (south)
+      const nw = lonLatToLocal(lon0, lat0), ne = lonLatToLocal(lon1, lat0);
+      const sw = lonLatToLocal(lon0, lat1), se = lonLatToLocal(lon1, lat1);
+      const y = -0.04;
+
+      // Building geometry is built via a Shape + rotateX(-90deg) extrusion, which puts
+      // it in world space at world_z = -rawY (see shapeFromPart / buildAllBuildings).
+      // lonLatToLocal returns a "geographic" z (north-positive); negating it here maps
+      // it into that same mesh-space convention so tiles line up with the buildings.
+      const positions = new Float32Array([
+        nw.x,y,-nw.z,  ne.x,y,-ne.z,  sw.x,y,-sw.z,
+        ne.x,y,-ne.z,  se.x,y,-se.z,  sw.x,y,-sw.z,
+      ]);
+      // Plain <img>-sourced textures default to flipY=true, under which the source
+      // image's top row (a tile's north edge, by XYZ tile convention) maps to V=1.
+      const uvs = new Float32Array([
+        0,1,  1,1,  0,0,
+        1,1,  1,0,  0,0,
+      ]);
+      const normals = new Float32Array(Array(6).fill([0,1,0]).flat());
+
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.BufferAttribute(positions,3));
+      geo.setAttribute('uv', new THREE.BufferAttribute(uvs,2));
+      geo.setAttribute('normal', new THREE.BufferAttribute(normals,3));
+      const mat = new THREE.MeshBasicMaterial({color:0xd6c9ac, transparent:true, opacity:0.95, side:THREE.DoubleSide});
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.raycast = ()=>{};
+      basemapGroup.add(mesh);
+
+      loader.load(esriTileUrl(zoom,tx,ty), (tex)=>{
+        tex.colorSpace = THREE.SRGBColorSpace || tex.colorSpace;
+        mat.map = tex;
+        mat.color.setHex(0xffffff);
+        mat.needsUpdate = true;
+        pending--;
+        if(pending===0) finishBasemapLoad(failed, total);
+      }, undefined, ()=>{
+        pending--; failed++;
+        if(pending===0) finishBasemapLoad(failed, total);
+      });
+    }
+  }
 }
 
-function mountBasemapPlane(){
-  const b = maplibreMap.getBounds();
-  const nw = lonLatToLocal(b.getWest(), b.getNorth());
-  const ne = lonLatToLocal(b.getEast(), b.getNorth());
-  const se = lonLatToLocal(b.getEast(), b.getSouth());
-  const sw = lonLatToLocal(b.getWest(), b.getSouth());
-  const y = -0.04;
-
-  // Building geometry lives in the raw EPSG:5179 "grid-north" local frame, which is
-  // rotated ~0.5deg from true north here. Rather than approximate the map footprint as
-  // an axis-aligned rectangle (which would appear subtly rotated relative to the
-  // buildings), we place each of its 4 corners at their exact grid-local position, so
-  // the quad is the true (very slightly non-axis-aligned) shape.
-  const positions = new Float32Array([
-    nw.x,y,nw.z,  ne.x,y,ne.z,  sw.x,y,sw.z,
-    ne.x,y,ne.z,  se.x,y,se.z,  sw.x,y,sw.z,
-  ]);
-  // MapLibre renders bearing=0 (north-up), so the canvas's top row is the map's north
-  // edge. With texture.flipY=false, V=0 samples that top/north row -- so V=0 -> north,
-  // V=1 -> south, U=0 -> west, U=1 -> east.
-  const uvs = new Float32Array([
-    0,0,  1,0,  0,1,
-    1,0,  1,1,  0,1,
-  ]);
-  const normals = new Float32Array(Array(6).fill([0,1,0]).flat());
-
-  const geo = new THREE.BufferGeometry();
-  geo.setAttribute('position', new THREE.BufferAttribute(positions,3));
-  geo.setAttribute('uv', new THREE.BufferAttribute(uvs,2));
-  geo.setAttribute('normal', new THREE.BufferAttribute(normals,3));
-
-  const tex = new THREE.CanvasTexture(maplibreMap.getCanvas());
-  tex.flipY = false;
-  tex.colorSpace = THREE.SRGBColorSpace || tex.colorSpace;
-  const mat = new THREE.MeshBasicMaterial({map:tex, transparent:true, opacity:0.9});
-  const mesh = new THREE.Mesh(geo, mat);
-  mesh.raycast = ()=>{};
-  basemapGroup.add(mesh);
+function finishBasemapLoad(failed, total){
+  const el = document.getElementById('mapAttrib');
+  if(failed===0) el.textContent = 'Imagery © Esri, Maxar, Earthstar Geographics';
+  else if(failed===total) el.textContent = '위성 지도를 불러오지 못했습니다 (네트워크 확인)';
+  else el.textContent = `Imagery © Esri, Maxar, Earthstar Geographics (일부 타일 누락 ${failed}/${total})`;
 }
 
 function setBasemap(on){
   state.basemap = on;
   if(on){
-    document.getElementById('mapAttrib').textContent = '지도를 불러오는 중...';
+    document.getElementById('mapAttrib').textContent = '위성 지도를 불러오는 중...';
     buildBasemap();
   }
   basemapGroup.visible = on;
-  groundGrid.material.opacity = on ? 0.35 : 1;
-  groundGrid.material.transparent = true;
+  groundGrid.visible = !on;
   groundDisk.visible = !on;
   document.getElementById('mapAttrib').style.display = on ? 'block' : 'none';
 }
@@ -898,10 +900,16 @@ function floorYPositionRaw(floorsBelow, floorNum){
 
 function refreshColors(){
   const deptActive = !!state.dept;
+  const emphasizing = state.selectedFloor !== null && typeof state.selectedBuildingIdx === 'number';
+  const FOCUS_COLOR = 0x2F6FED; // deliberately far outside the warm palette so the selected floor is unmistakable
   floorMeshes.forEach(fm=>{
     const b = DATA.buildings[fm.buildingIdx];
+    const isFocusedFloor = emphasizing && fm.buildingIdx === state.selectedBuildingIdx && fm.floor === state.selectedFloor;
+    const isDimmedSibling = emphasizing && fm.buildingIdx === state.selectedBuildingIdx && fm.floor !== state.selectedFloor;
     let color;
-    if(!fm.hasData){
+    if(isFocusedFloor){
+      color = FOCUS_COLOR;
+    } else if(!fm.hasData){
       color = GRAY;
     } else if(deptActive){
       const sessions = floorDeptSessions(fm.buildingName, fm.floor, state.dept);
@@ -915,6 +923,14 @@ function refreshColors(){
       color = rate === null ? GRAY : usageColorHex(rate);
     }
     fm.mesh.material.color.setHex(color);
+
+    const baseOpacity = fm.floor < 0 ? 0.55 : 1;
+    fm.mesh.material.transparent = true;
+    fm.mesh.material.opacity = isDimmedSibling ? baseOpacity*0.25 : baseOpacity;
+    if(fm.mesh.material.emissive){
+      fm.mesh.material.emissive.setHex(isFocusedFloor ? FOCUS_COLOR : 0x000000);
+      fm.mesh.material.emissiveIntensity = isFocusedFloor ? 0.35 : 0;
+    }
     fm.mesh.material.needsUpdate = true;
   });
   document.getElementById('legendTitle').textContent = deptActive ? (state.dept + ' 사용 강도') : '사용률';
@@ -922,6 +938,40 @@ function refreshColors(){
   legend.querySelector('.legend-bar').style.background = deptActive
     ? 'linear-gradient(90deg,#E6DAC4,#b5906a,#8a5636)'
     : 'linear-gradient(90deg,#dfd3c3,#c7b199,#9f8473,#6c5d53)';
+  updateFloorHighlight();
+}
+
+// Draws a bright outline "collar" around the currently selected floor so it reads
+// clearly against its (dimmed) siblings, independent of the color/opacity above.
+function updateFloorHighlight(){
+  highlightGroup.clear();
+  const emphasizing = state.selectedFloor !== null && typeof state.selectedBuildingIdx === 'number';
+  if(!emphasizing){ highlightGroup.visible = false; return; }
+  const b = DATA.buildings[state.selectedBuildingIdx];
+  if(!b || !b.has_data){ highlightGroup.visible = false; return; }
+
+  const floor = state.selectedFloor;
+  const baseY = floorYPositionRaw(b.floors_below, floor);
+  const yLevels = [baseY + 0.06, baseY + FLOOR_H*0.94*0.5, baseY + FLOOR_H*0.94 - 0.06];
+  let any = false;
+  b.parts.forEach(part=>{
+    const ring = part.exterior.slice();
+    if(ring.length && (ring[0][0]!==ring[ring.length-1][0] || ring[0][1]!==ring[ring.length-1][1])){
+      ring.push(ring[0]);
+    }
+    yLevels.forEach(y=>{
+      // Negate the raw y the same way buildAllBuildings does (Shape + rotateX(-90deg)
+      // puts world_z = -rawY), so this outline lines up with the real building mesh.
+      const pts = ring.map(([x,rawY])=>new THREE.Vector3(x, y, -rawY));
+      const lineGeo = new THREE.BufferGeometry().setFromPoints(pts);
+      const lineMat = new THREE.LineBasicMaterial({color:0xFFFFFF, transparent:true, opacity:0.95, depthTest:true});
+      const line = new THREE.Line(lineGeo, lineMat);
+      line.raycast = ()=>{};
+      highlightGroup.add(line);
+      any = true;
+    });
+  });
+  highlightGroup.visible = any;
 }
 function usageColorHexTeal(t){
   const c0=[230,218,196], c1=[181,144,106], c2=[138,86,54];
@@ -1096,13 +1146,36 @@ function handleClick(e){
 }
 
 function flyToBuilding(idx){
+  frameBuilding(idx);
+}
+
+// Fits the camera so the whole building (all floors, all footprint parts) is visible,
+// based on its actual bounding box rather than a rough floor-count heuristic.
+function frameBuilding(idx){
   const b = DATA.buildings[idx];
-  // compute centroid of first part
-  const pts = b.parts[0].exterior;
-  let cx=0, cy=0; pts.forEach(([x,y])=>{cx+=x; cy+=y;});
-  cx/=pts.length; cy/=pts.length;
-  camTarget.set(cx, Math.max(10, ((b.floors_above||1)*FLOOR_H)/2), cy);
-  camSpherical.radius = Math.max(60, Math.min(160, 40 + (b.floors_above||1)*14));
+  let minX=Infinity,maxX=-Infinity,minZ=Infinity,maxZ=-Infinity;
+  b.parts.forEach(part=>{
+    part.exterior.forEach(([x,rawY])=>{
+      // Building meshes are built from this same (x, rawY) data via a Shape + rotateX(-90deg)
+      // extrusion, which lands them in world space at world_z = -rawY (see shapeFromPart /
+      // buildAllBuildings). We negate here too so this bounding box matches the real mesh.
+      const z = -rawY;
+      minX=Math.min(minX,x); maxX=Math.max(maxX,x);
+      minZ=Math.min(minZ,z); maxZ=Math.max(maxZ,z);
+    });
+  });
+  const cx=(minX+maxX)/2, cz=(minZ+maxZ)/2;
+  const width = maxX-minX, depth = maxZ-minZ;
+  const floorsAbove = b.floors_above||1, floorsBelow = b.floors_below||0;
+  const topY = floorsAbove*FLOOR_H, bottomY = -floorsBelow*FLOOR_H;
+  const height = topY-bottomY;
+  const cy = (topY+bottomY)/2;
+
+  camTarget.set(cx, Math.max(4,cy), cz);
+  const boundRadius = Math.sqrt(width*width + depth*depth + height*height)/2;
+  const fovRad = camera.fov * Math.PI/180;
+  const fitRadius = (boundRadius / Math.sin(fovRad/2)) * 1.25;
+  camSpherical.radius = Math.max(28, Math.min(320, fitRadius));
   updateCameraFromSpherical();
 }
 
@@ -1174,6 +1247,7 @@ function selectBuilding(idx, floor){
   state.selectedRoomKey = null;
   renderDrawer();
   renderSidebar();
+  refreshColors();
 }
 function selectNoGeoBuilding(name){
   state.selectedBuildingIdx = 'ng:'+name;
@@ -1181,6 +1255,7 @@ function selectNoGeoBuilding(name){
   state.selectedRoomKey = null;
   renderDrawer();
   renderSidebar();
+  refreshColors();
 }
 function selectRoom(key){
   state.selectedRoomKey = key;
@@ -1266,7 +1341,8 @@ function renderDrawer(){
       const f = parseInt(el.dataset.floor,10);
       state.selectedFloor = (state.selectedFloor===f)? null : f;
       renderDrawer();
-      if(typeof state.selectedBuildingIdx === 'number') flyToBuilding(state.selectedBuildingIdx);
+      refreshColors();
+      if(typeof state.selectedBuildingIdx === 'number') frameBuilding(state.selectedBuildingIdx);
     };
   });
   body.querySelectorAll('.room-row').forEach(el=>{
@@ -1517,12 +1593,16 @@ function fullRefresh(){
 }
 
 window.__APPCTRL__ = {
-  clearSelection(){ state.selectedBuildingIdx=null; state.selectedFloor=null; state.selectedRoomKey=null; renderDrawer(); renderSidebar(); },
+  clearSelection(){
+    state.selectedBuildingIdx=null; state.selectedFloor=null; state.selectedRoomKey=null;
+    renderDrawer(); renderSidebar(); refreshColors();
+  },
   backToBuilding(name){
     const b = geoBuildingByName[name];
     state.selectedRoomKey = null;
     if(b) state.selectedBuildingIdx = b.__idx; else state.selectedBuildingIdx = 'ng:'+name;
     renderDrawer();
+    refreshColors();
   },
 };
 
