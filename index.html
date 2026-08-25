@@ -284,9 +284,20 @@ table.dtable td.num{font-family:'JetBrains Mono',monospace;text-align:right;}
 footer{padding:16px 28px;border-top:1px solid var(--line);color:var(--text-faint);font-size:12.5px;text-align:center;}
 
 @media(max-width:900px){
+  header{flex-wrap:wrap;row-gap:10px;}
+  .brand{width:100%;margin-right:0;}
+  .hdr-controls{width:100%;}
+  .hdr-stats{width:100%;margin-left:0;padding-left:0;border-left:none;justify-content:space-between;
+    border-top:1px solid var(--line);padding-top:10px;}
+  .hdr-stat{align-items:flex-start;}
+
   .viewer-row{flex-direction:column;height:auto;}
-  .sidebar,.drawer{width:100%;max-height:280px;}
-  .viewport{height:420px;}
+  .sidebar{width:100%;max-height:none;order:2;}
+  .sidebar-section{flex:none !important;}
+  .list{max-height:38vh;}
+  .list.tall{flex:none;max-height:38vh;}
+  .drawer{width:100%;max-height:60vh;order:3;}
+  .viewport{height:56vh;min-height:340px;order:1;}
 }
 </style>
 </head>
@@ -359,7 +370,7 @@ footer{padding:16px 28px;border-top:1px solid var(--line);color:var(--text-faint
       <div class="crosshair-corner tl"></div><div class="crosshair-corner tr"></div>
       <div class="crosshair-corner bl"></div><div class="crosshair-corner br"></div>
       <div class="viewport-caption" id="viewportCaption">3D CAMPUS · 층별 사용률 뷰</div>
-      <div class="viewport-hint">드래그: 회전 · 휠: 확대/축소 · 우클릭 드래그: 이동 · 클릭: 층 선택</div>
+      <div class="viewport-hint" id="viewportHint">드래그: 회전 · 휠: 확대/축소 · 우클릭 드래그: 이동 · 클릭: 층 선택</div>
     </div>
     <div class="legend" id="legend">
       <div class="legend-title" id="legendTitle">사용률</div>
@@ -923,7 +934,6 @@ function usageColorHexTeal(t){
 /* ---- camera rig: simple orbit/pan/zoom around a target ---- */
 let camTarget = new THREE.Vector3(0, 22, 0);
 let camSpherical = {radius: 260, theta: Math.PI*0.28, phi: Math.PI*0.36};
-let dragging = false, panning = false, lastX=0, lastY=0;
 let animTarget = null;
 
 function updateCameraFromSpherical(){
@@ -939,41 +949,96 @@ function initCameraRig(){
   updateCameraFromSpherical();
 }
 
+function panCamera(dx, dy){
+  const dir = new THREE.Vector3(); camera.getWorldDirection(dir);
+  const camRight = new THREE.Vector3().crossVectors(camera.up, dir).normalize();
+  const camUp = new THREE.Vector3(0,1,0);
+  camTarget.addScaledVector(camRight, dx*0.25);
+  camTarget.addScaledVector(camUp, dy*0.25);
+}
+
 function bindPointerEvents(){
   const el = renderer.domElement;
+  el.style.touchAction = 'none'; // we handle all pan/zoom/rotate gestures ourselves
   el.addEventListener('contextmenu', e=>e.preventDefault());
-  el.addEventListener('mousedown', e=>{
-    if(e.button===0){ dragging=true; } else if(e.button===2){ panning=true; }
-    lastX=e.clientX; lastY=e.clientY;
+
+  const pointers = new Map(); // pointerId -> {x,y}
+  let mode = null; // 'rotate' | 'pan' | 'pinch'
+  let lastMid = null, lastDist = null;
+  let moved = 0;
+
+  function midpoint(){
+    const pts = [...pointers.values()];
+    return {x:(pts[0].x+pts[1].x)/2, y:(pts[0].y+pts[1].y)/2};
+  }
+  function dist(){
+    const pts = [...pointers.values()];
+    return Math.hypot(pts[0].x-pts[1].x, pts[0].y-pts[1].y);
+  }
+
+  el.addEventListener('pointerdown', e=>{
+    try{ el.setPointerCapture(e.pointerId); }catch(err){}
+    pointers.set(e.pointerId, {x:e.clientX, y:e.clientY});
+    moved = 0;
+    if(e.pointerType === 'touch') tooltipEl.style.display = 'none';
+    if(pointers.size === 1){
+      mode = (e.button === 2) ? 'pan' : 'rotate';
+    } else if(pointers.size === 2){
+      mode = 'pinch';
+      lastDist = dist();
+      lastMid = midpoint();
+    }
   });
-  window.addEventListener('mouseup', ()=>{dragging=false; panning=false;});
-  el.addEventListener('mousemove', e=>{
-    const dx=e.clientX-lastX, dy=e.clientY-lastY;
-    lastX=e.clientX; lastY=e.clientY;
-    if(dragging){
+
+  el.addEventListener('pointermove', e=>{
+    if(!pointers.has(e.pointerId)){
+      if(e.pointerType !== 'touch') handleHover(e);
+      return;
+    }
+    const prev = pointers.get(e.pointerId);
+    const dx = e.clientX-prev.x, dy = e.clientY-prev.y;
+    pointers.set(e.pointerId, {x:e.clientX, y:e.clientY});
+    moved += Math.hypot(dx,dy);
+
+    if(mode === 'rotate' && pointers.size === 1){
       camSpherical.theta -= dx*0.006;
       camSpherical.phi = Math.max(0.12, Math.min(Math.PI/2-0.02, camSpherical.phi - dy*0.006));
       updateCameraFromSpherical();
-    } else if(panning){
-      const right = new THREE.Vector3(); camera.getWorldDirection(right);
-      const camRight = new THREE.Vector3().crossVectors(camera.up, right).normalize();
-      const camUp = new THREE.Vector3(0,1,0);
-      camTarget.addScaledVector(camRight, dx*0.25);
-      camTarget.addScaledVector(camUp, dy*0.25);
+    } else if(mode === 'pan' && pointers.size === 1){
+      panCamera(dx, dy);
       updateCameraFromSpherical();
-    } else {
-      handleHover(e);
+    } else if(mode === 'pinch' && pointers.size === 2){
+      const nd = dist(), nm = midpoint();
+      const scale = nd / (lastDist || nd);
+      camSpherical.radius = Math.max(30, Math.min(600, camSpherical.radius / scale));
+      panCamera(nm.x-lastMid.x, nm.y-lastMid.y);
+      lastDist = nd; lastMid = nm;
+      updateCameraFromSpherical();
     }
   });
+
+  function endPointer(e){
+    const wasSingle = pointers.size === 1;
+    const tapCandidate = wasSingle && mode === 'rotate' && moved < 6;
+    pointers.delete(e.pointerId);
+    if(pointers.size === 0){
+      if(tapCandidate) handleClick(e);
+      mode = null;
+    } else if(pointers.size === 1){
+      // dropped from pinch/pan back to a single remaining finger: resume rotate cleanly
+      mode = 'rotate';
+      moved = 0;
+    }
+  }
+  el.addEventListener('pointerup', endPointer);
+  el.addEventListener('pointercancel', endPointer);
+
   el.addEventListener('wheel', e=>{
     e.preventDefault();
     camSpherical.radius = Math.max(30, Math.min(600, camSpherical.radius + e.deltaY*0.18));
     updateCameraFromSpherical();
   }, {passive:false});
-  el.addEventListener('click', e=>{
-    if(Math.hypot(e.clientX-lastX, e.clientY-lastY) > 3) return;
-    handleClick(e);
-  });
+
   window.addEventListener('resize', onResize);
 }
 
@@ -982,7 +1047,6 @@ function onResize(){
   camera.updateProjectionMatrix();
   renderer.setSize(viewportEl.clientWidth, viewportEl.clientHeight);
 }
-
 function pickMesh(e){
   const rect = renderer.domElement.getBoundingClientRect();
   mouse.x = ((e.clientX-rect.left)/rect.width)*2-1;
@@ -1140,7 +1204,7 @@ function renderDrawer(){
     floorsAbove=b.floors_above; floorsBelow=b.floors_below; hasData=true;
   } else {
     const b = DATA.buildings[state.selectedBuildingIdx];
-    bName = b.name;
+    bName = b.name || `무명 건물 #${b.fid}`;
     floorsAbove=b.floors_above; floorsBelow=b.floors_below; hasData=b.has_data;
   }
 
@@ -1465,6 +1529,11 @@ window.__APPCTRL__ = {
 initHeader();
 initScene();
 fullRefresh();
+
+const isTouch = matchMedia('(pointer: coarse)').matches;
+document.getElementById('viewportHint').textContent = isTouch
+  ? '한 손가락: 회전 · 두 손가락: 확대/이동 · 탭: 층 선택'
+  : '드래그: 회전 · 휠: 확대/축소 · 우클릭 드래그: 이동 · 클릭: 층 선택';
 
 })();
 
